@@ -11,6 +11,7 @@ import time
 
 import httpx
 import psycopg
+from httpx import Client
 from psycopg.rows import dict_row
 
 DATABASE_URL = os.environ.get(
@@ -23,8 +24,7 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
 MAX_ATTEMPTS = 3
 
 
-def sign(body: dict) -> str:
-    raw = json.dumps(body).encode()
+def sign(raw: bytes) -> str:
     return "sha256=" + hmac.new(WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
 
 
@@ -41,37 +41,73 @@ def fetch_pending(conn):
     ).fetchall()
 
 
-def deliver(client, event) -> int:
-    """Returns the number of attempts used, or 0 if delivery failed."""
+def deliver(client: Client, event):
     body = {
         "event_id": event["event_id"],
         "type": event["type"],
         "payload": event["payload"],
     }
-    headers = {"X-RelayOps-Signature": sign(body)}
+    request = client.build_request("POST", RECEIVER_URL, json=body)
+    request.headers["X-RelayOps-Signature"] = sign(request.content)
+    delivery_attempts = []
+    status = "failed"
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            resp = client.post(RECEIVER_URL, json=body, headers=headers)
-            print(f"delivered {event['event_id']} attempt={attempt} -> {resp.status_code}")
-            return attempt
-        except httpx.HTTPError as exc:
+            response = client.send(request)
+            response.raise_for_status()
+            print(f"delivered {event['event_id']} attempt={attempt} -> {response.status_code}")
+            delivery_attempts.append({
+                "attempt": attempt,
+                "status_code": response.status_code,
+                "error": None
+            })
+            status = "delivered"
+            break
+        except httpx.RequestError as exc:
             print(f"error delivering {event['event_id']} attempt={attempt}: {exc}")
+            delivery_attempts.append({
+                "attempt": attempt,
+                "status_code": None,
+                "error": exc
+            })
             time.sleep(2 ** attempt)
-    return 0
+        except httpx.HTTPStatusError as exc:
+            print(f"error http code {exc.response.status_code} while delivering {event['event_id']}: {exc}")
+            if exc.response.status_code == 429 or 500 <= exc.response.status_code < 599:
+                retry_seconds = 0
+                try:
+                    retry_seconds = int(exc.response.headers["Retry-After"])
+                except ValueError | KeyError:
+                    pass
+                delivery_attempts.append({
+                    "attempt": attempt,
+                    "status_code": exc.response.status_code,
+                    "error": None
+                })
+                time.sleep(max(2 ** attempt, retry_seconds))
+            else:
+                delivery_attempts.append({
+                    "attempt": attempt,
+                    "status_code": exc.response.status_code,
+                    "error": None
+                })
+                break
+    return status, delivery_attempts
 
 
 def main():
     print(f"worker started, receiver={RECEIVER_URL}")
-    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True)
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=False)
     with httpx.Client(timeout=5) as client:
         while True:
             events = fetch_pending(conn)
             for event in events:
-                attempts = deliver(client, event)
+                status, delivery_attempts = deliver(client, event)
                 conn.execute(
                     "UPDATE events SET status = %s, attempts = %s, updated_at = now() WHERE id = %s",
-                    ("delivered" if attempts else "failed", attempts or MAX_ATTEMPTS, event["id"]),
+                    (status, len(delivery_attempts), event["id"]),
                 )
+                conn.commit()
             if not events:
                 time.sleep(POLL_INTERVAL)
 

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from psycopg.types.json import Jsonb
 
 from .db import get_conn
@@ -12,10 +12,24 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/events", status_code=202)
-def create_event(event: EventIn):
-    # TODO: idempotency
+@app.post("/events")
+def create_event(event: EventIn, response: Response):
     conn = get_conn()
+    row = conn.execute(
+        """
+        SELECT event_id, type, payload, status
+        FROM events WHERE event_id = %s
+        ORDER BY id LIMIT 1
+        """,
+        (event.event_id,),
+    ).fetchone()
+
+    if row is not None:
+        if row["type"] == event.type and row["payload"] == event.payload:
+            return { "event_id": event.event_id, "status": row["status"]}
+        else:
+            raise HTTPException(status_code=409)
+
     row = conn.execute(
         """
         INSERT INTO events (event_id, type, payload)
@@ -25,6 +39,7 @@ def create_event(event: EventIn):
         (event.event_id, event.type, Jsonb(event.payload)),
     ).fetchone()
     conn.commit()
+    response.status_code = 202
     return row
 
 
@@ -40,8 +55,18 @@ def get_event(event_id: str):
         (event_id,),
     ).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="event not found")
+        raise HTTPException(status_code=404, detail=f"event not found \"{event_id}\"")
 
-    # TODO: include delivery attempt history
-    row["delivery_attempts"] = []
+    row["delivery_attempts"] = [] if row["attempts"] == 0 else conn.execute(
+        """
+        SELECT event_pk, attempt, status_code, error, created_at
+        FROM delivery_attempts WHERE event_pk = %s
+        ORDER BY id
+        """,
+        (row["id"],),
+    ).fetchall()
     return row
+
+@app.get("/metrics")
+def get_metrics():
+    pass
