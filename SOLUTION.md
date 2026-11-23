@@ -1,35 +1,47 @@
 # SOLUTION
 
-> Completează acest fișier. Răspunsurile scurte și concrete sunt preferate.
-
 ## 1. Probleme identificate și cum le-ai rezolvat
 
-Pentru fiecare problemă: simptom → cum ai investigat (comenzi, loguri, ipoteze) → cauză → soluție.
-
-| # | Componentă | Simptom | Cauză | Soluție |
-|---|------------|---------|-------|---------|
-| 1 |            |         |       |         |
+| # | Componentă     | Simptom                                                                                            | Cauză                                                                                                                                       | Soluție                                                                                                                                                                                                                                                                      |
+|---|----------------|----------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1 | Gateway Nginx  | Respinge orice body mai mare de 1kb                                                                | ```client_max_body_size 1k``` fusese introdus in nginx.conf                                                                                 | Ajustat la ```client_max_body_size 1m``` pentru a se conforma cu specificatiile din README.md                                                                                                                                                                                |
+| 2 | Gateway Nginx  | Locatia ```/events``` nu primea niciun request body                                                | ```proxy_pass_request_body off``` elimina request body-ul, si headerul ```Content-Length``` era sters (doar pentru endpointul ```/events``` | Eliminarea acestor optiuni pentru a reveni la default (pasarea body-ului intreg)                                                                                                                                                                                             |
+| 3 | docker-compose | Docker-compose folosea variable de mediu hardcodate                                                |                                                                                                                                             | Inlocuirea acestora cu expresii ```${VAR}``` care sunt substituite dinamic pe baza fisierului .env                                                                                                                                                                           |
+| 4 | docker-compose | Workerul era prevenit din a se conecta la adresa ip corecta a receiver-ului                          | ```docker-compose.override``` suprascria adresa ip a receiver-ului cu 192.0.2.10, conducand workerul la o adresa invalida           | Eliminarea optiunii "extra_hosts" din docker_compose.override                                                                                                                                                                                                                                            |
+| 5 | API            | ```get_conn()``` recicleaza aceeasi conexiune globala, folosita in paralel de toate endpoint-urile |                                                                                                                                             | Utilizarea unui ConnectionPool pentru a asigura ca tranzactiile se executa separat de catre fiecare endpoint                                                                                                                                                                 |
+| 6 | API            | API-ul nu e accesibil de catre gateway                                                             | Uvicorn accepta conexiuni doar de la 127.0.0.1, prin optiunea ```--host 127.0.0.1```                                                        | Inlocuirea cu ```--host 0.0.0.0``` pentru a-l face disponibil pentru reteaua locala                                                                                                                                                                                          |
+| 7 | Worker         | Request-urile sunt respinse cu 401 Unauthorized                                                    | Serializarea JSON din json.dumps() nu se potriveste cu cea a httpx, ducand la semnaturi calculate diferit intre worker si receiver          | Utilizarea functiei sign() direct peste ```request.content```, asigurand ca workerul va semna intotdeauna exact acelasi continut pe care il va verifica receiverul                                                                                                           |
+| 8 | Worker         | Workerii care ruleaza in paralel pot procesa aceleasi evenimente                                   | ```fetch_workers()``` executa un simplu SELECT peste baza de date, fara vreo coordonare intre procese                                       | Eliminarea optiunii autocommit din worker, plus revendicarea evenimentelor de catre un singur worker intr-o operatie atomica: se cauta randurile cu status "pending" cu ```SELECT ... FOR UPDATE SKIP LOCKED```, apoi acele randuri se actualizeaza la status = "processing" |
+| 9 | Worker         | Evenimentele revendicate pot ramane neprocesate in cazul inchiderii cu SIGTERM/SIGINT              |                                                                                                                                             | Folosirea unui ```threading.Event``` numit "shutdown", si instalarea unui signal handler care il seteaza, pe care functiile worker-ului il pot verifica pentru a se pregati de cleanup, punand eventurile neterminate inapoi in starea "pending"                             |
 
 ## 2. Diagnostic networking
 
-Descrie pașii prin care ai identificat problemele de rețea (ce ai rulat, ce ai observat).
+Am facut o verificare preliminara cu un AI a fisierelor de configurare, pentru fisierele nginx.conf, docker-compose. Asta a eliminat cu usurinta greselile evidente. Odata rezolvate, celelalte componente au functionat normal din fericire, daca inca ar fi existat probleme as fi putut intra in fiecare container sa incerc "docker exec ping <nume>".
+
 
 ## 3. Decizii tehnice
 
-- Idempotency:
-- Retry (ce erori consideri temporare, backoff):
-- Recuperare după restart:
-- Altele:
+- Idempotency: Pentru POST /events: Se verifica daca un eveniment deja exista, caz in care se verifica si continutul (type, payload), in caz de conflict raspunsul este 409, altfel se returneaza statusul si raspunsul este 200 OK. Daca nu exista deja, este adaugat si se returneaza 202 Accepted. Baza de date este protejata de acces concurent, nu se poate adauga acelasi event de doua ori. 
+- Retry (ce erori consideri temporare, backoff): Erorile temporare: 429, orice cod intre 500-599. Formula de backoff exponential 2**attempt a ramas neschimbata, iar numarul de attempt-uri maxim este 3; astfel dupa primul attempt, urmatoarele doua for avea loc la 2, apoi 4 secunde. Orice alt cod in afara de 2xx este considerat fail imediat.
+- Recuperare după restart: Workerii revendica BATCH_SIZE=10 eventuri "pending", ale caror statusuri ei le seteaza la "processing", asa nu mai pot fi gasite de ceilalti workeri care cauta in paralel alte eventuri "pending". In caz ca primesc SIGTERM, eventurilor ramase neprocesate li se seteaza statusul la "pending" inainte de shutdown, pentru a putea fi gasite de ceilalti workeri ramasi (sau in caz ca raman 0 workeri, cand se vor porni altii noi le vor vedea).
+- Altele: Am modificat schema bazei de date (nu sunt sigur daca era permis). Am introdus mai intai un view asupra "events" numit "events_with_attempts" care calculeaza dinamic campul vechi "attempts", derivat din numarul de delivery_attempts al unui event id anume pentru a ma ajuta la simplificarea endpointului GET /events/{event_id}, nu mai este nevoie sa editez manual campul "attempts" dupa ce workerul termina o livrare. Apoi, am creat viewul "delivery_attempts_numbered" care numeroteaza cronologic (in ordinea "created_at", apoi "id"-ului serial in caz de egalitate) delivery_attempturile fiecarui event_id. Prin asta, elimin nevoia de a verifica in worker la fiecare incercare de delivery cate incercari anterioare s-au executat, si nu mai trebuie sa introduc manual numarul attempt-ului la fiecare delivery.
 
 ## 4. Cum pornești și verifici sistemul
-
+Pornire:
 ```bash
-# comenzi
+docker compose up --build
+```
+Teste, rulate live:
+```bash
+pytest test_api.py
+pytest test_worker.py
 ```
 
 ## 5. Instrumente AI utilizate
 
-Ce instrumente ai folosit, pentru ce, și cum ai verificat ce au produs.
-Menționează cel puțin un caz în care AI-ul a greșit și cum ai observat.
+Claude Sonnet 5.5 varianta desktop, plan gratuit.
+Greseli ale AI-ului: de exemplu, la generarea X-Request-ID, solutia sugerata initial inversase map-ul, facand request_idurile generate corect sa se stearga si sa genereze unul nou, iar cele incorecte sa fie pasate mai departe. Am reparat asta odata ce i-am spus sa genereze un unit test care verifica request_idul, si-a dat seama apoi ca in fisierul de confifgurare mapul era pus invers.
+
 
 ## 6. Ce ai îmbunătăți cu mai mult timp
+Logging mai bun pentru API si pentru worker, statistici separate pe x-request-id, unit teste mai bune (nu pe baza de date live), pipline CI/CD pentru GitHub Actions, etc. 
