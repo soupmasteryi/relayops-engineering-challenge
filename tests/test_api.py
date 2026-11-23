@@ -351,3 +351,37 @@ def test_get_returns_the_requested_event_among_several(client, event):
     assert response.status_code == 200
     assert response.json()["event_id"] == other["event_id"]
     assert response.json()["type"] == "invoice.paid"
+
+
+
+
+# --------------------------------------------------------------------------
+# GET /metrics
+# --------------------------------------------------------------------------
+METRICS_SAMPLES = re.compile(
+    r'relayops_events\{status="pending"} \d+\n'
+    r'relayops_events\{status="processing"} \d+\n'
+    r'relayops_events\{status="delivered"} \d+\n'
+    r'relayops_events\{status="failed"} \d+\n'
+    r"relayops_delivery_attempts_total \d+\n"
+)
+
+
+def test_metrics_matches_expected_format(client):
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+
+    # Ignore the "# HELP" / "# TYPE" comment lines; the rest must look like:
+    #   relayops_events{status="pending"} 3
+    #   relayops_events{status="processing"} 0
+    #   relayops_events{status="delivered"} 120
+    #   relayops_events{status="failed"} 2
+    #   relayops_delivery_attempts_total 131
+    samples = "".join(
+        line + "\n"
+        for line in response.text.splitlines()
+        if not line.startswith("#")
+    )
+    assert METRICS_SAMPLES.fullmatch(samples), samples
